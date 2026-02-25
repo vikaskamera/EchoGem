@@ -3,6 +3,7 @@ Transcript chunking module using Google Gemini for intelligent segmentation.
 """
 
 import os
+import re
 import json
 import google.generativeai as genai
 from typing import List, Optional
@@ -140,56 +141,159 @@ class Chunker:
         """
 
     def _parse_chunk_response(self, response_text: str) -> List[Chunk]:
-        """Parse the LLM response into Chunk objects"""
+        """Parse the LLM response into Chunk objects.
+
+        This method is robust to extra explanatory text before/after the JSON
+        by scanning for the first valid JSON object or array using
+        json.JSONDecoder.raw_decode.
+        """
+        if not isinstance(response_text, str):
+            raise ValueError("Expected string response from LLM")
+
+        decoder = json.JSONDecoder()
+        data = None
+        last_error: Optional[Exception] = None
+
+        # First, try to parse the whole response as JSON
         try:
-            # Extract JSON from response
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
-            
-            if start_idx == -1 or end_idx == 0:
-                raise ValueError("No JSON found in response")
-            
-            json_str = response_text[start_idx:end_idx]
-            data = json.loads(json_str)
-            
-            chunks = []
-            for chunk_data in data.get('chunks', []):
-                chunk = Chunk(
-                    title=chunk_data.get('title', 'Untitled'),
-                    content=chunk_data.get('content', ''),
-                    keywords=chunk_data.get('keywords', []),
-                    named_entities=chunk_data.get('named_entities', []),
-                    timestamp_range=chunk_data.get('timestamp_range', ''),
-                    chunk_id=f"chunk_{len(chunks)}"
-                )
-                chunks.append(chunk)
-            
-            return chunks
-            
-        except Exception as e:
-            print(f"Error parsing chunk response: {e}")
-            return []
+            data = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            last_error = e
+
+        # If that fails, scan for the first JSON object/array within the text
+        if data is None:
+            for idx, ch in enumerate(response_text):
+                if ch in "{[":
+                    try:
+                        data, end = decoder.raw_decode(response_text[idx:])
+                        break
+                    except json.JSONDecodeError as e:
+                        last_error = e
+                        continue
+
+        if data is None:
+            raise ValueError(f"Could not parse JSON from response: {last_error}")
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected JSON object with 'chunks' field, got {type(data).__name__}")
+
+        raw_chunks = data.get("chunks") or []
+        if not isinstance(raw_chunks, list):
+            raise ValueError("Expected 'chunks' to be a list in JSON response")
+
+        chunks: List[Chunk] = []
+        for chunk_data in raw_chunks:
+            if not isinstance(chunk_data, dict):
+                continue
+
+            content = (chunk_data.get("content") or "").strip()
+            if not content:
+                continue
+
+            chunk = Chunk(
+                title=(chunk_data.get("title") or "Untitled").strip() or "Untitled",
+                content=content,
+                keywords=chunk_data.get("keywords") or [],
+                named_entities=chunk_data.get("named_entities") or [],
+                timestamp_range=chunk_data.get("timestamp_range") or "",
+                chunk_id=f"chunk_{len(chunks)}",
+            )
+            chunks.append(chunk)
+
+        if not chunks:
+            raise ValueError("No valid chunks parsed from JSON response")
+
+        return chunks
 
     def _fallback_chunking(self, transcript: str) -> List[Chunk]:
-        """Fallback chunking method using simple text splitting"""
-        words = transcript.split()
-        chunks = []
-        chunk_size = self.max_tokens
-        
-        for i in range(0, len(words), chunk_size):
-            chunk_words = words[i:i + chunk_size]
-            chunk_text = ' '.join(chunk_words)
-            
+        """Fallback chunking that preserves semantic boundaries where possible.
+
+        Instead of naive fixed-word chunks, this method:
+        - Splits on paragraphs and sentences when possible
+        - Packs consecutive sentences into chunks up to an approximate
+          max token/word budget
+        - Only falls back to word-based splitting for extremely long sentences
+        """
+        text = transcript.strip()
+        if not text:
+            return []
+
+        max_words = max(self.max_tokens, 1)
+        chunks: List[Chunk] = []
+        current_sentences: List[str] = []
+        current_word_count = 0
+
+        def flush_chunk() -> None:
+            nonlocal current_sentences, current_word_count
+            if not current_sentences:
+                return
+            chunk_text = " ".join(current_sentences).strip()
+            if not chunk_text:
+                current_sentences = []
+                current_word_count = 0
+                return
+
             chunk = Chunk(
                 title=f"Chunk {len(chunks) + 1}",
                 content=chunk_text,
                 keywords=[],
                 named_entities=[],
                 timestamp_range="",
-                chunk_id=f"fallback_chunk_{len(chunks)}"
+                chunk_id=f"fallback_chunk_{len(chunks)}",
             )
             chunks.append(chunk)
-        
+            current_sentences = []
+            current_word_count = 0
+
+        # Split into paragraphs first to respect larger structural breaks
+        paragraphs = re.split(r"\n\s*\n+", text)
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+
+            # Split paragraph into sentences using simple punctuation heuristic
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+
+                words_in_sentence = sentence.split()
+                sentence_word_count = len(words_in_sentence)
+
+                # Handle sentences longer than max_words by word-based splitting
+                if sentence_word_count > max_words:
+                    # Finish any current chunk before splitting this long sentence
+                    flush_chunk()
+
+                    for i in range(0, sentence_word_count, max_words):
+                        chunk_words = words_in_sentence[i : i + max_words]
+                        chunk_text = " ".join(chunk_words).strip()
+                        if not chunk_text:
+                            continue
+                        chunk = Chunk(
+                            title=f"Chunk {len(chunks) + 1}",
+                            content=chunk_text,
+                            keywords=[],
+                            named_entities=[],
+                            timestamp_range="",
+                            chunk_id=f"fallback_chunk_{len(chunks)}",
+                        )
+                        chunks.append(chunk)
+                    continue
+
+                # If adding this sentence would exceed the limit, start a new chunk
+                if current_word_count + sentence_word_count > max_words:
+                    flush_chunk()
+
+                current_sentences.append(sentence)
+                current_word_count += sentence_word_count
+
+        # Flush any remaining content
+        flush_chunk()
+
         return chunks
 
     def get_embeddings(self, text: str) -> List[float]:
